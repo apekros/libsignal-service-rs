@@ -1,6 +1,7 @@
 use crate::utils::serde_base64_url_safe_no_pad;
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use libsignal_core::{Aci, ServiceIdKind};
+use rand::RngCore as _;
 use reqwest::Method;
 use serde::Serialize;
 
@@ -238,6 +239,179 @@ impl SignalWebSocket<Identified> {
             result.username_link_handle,
             &entropy,
         ))
+    }
+}
+
+/// The most username candidates the server accepts in one reservation request.
+pub const MAX_USERNAME_CANDIDATES: usize = 20;
+
+/// A username the server has reserved for this account, but not yet confirmed.
+///
+/// Only [SignalWebSocket::reserve_username] creates these, and
+/// [SignalWebSocket::confirm_username] consumes them, so you can't confirm
+/// something the server never reserved for you.
+pub struct UsernameReservation {
+    username: usernames::Username,
+}
+
+impl UsernameReservation {
+    pub fn username(&self) -> &usernames::Username {
+        &self.username
+    }
+}
+
+/// A username that now belongs to this account.
+pub struct ConfirmedUsername {
+    pub username: usernames::Username,
+    /// Shareable `https://signal.me/#eu/...` link, if the server assigned a
+    /// link handle.
+    pub link: Option<url::Url>,
+}
+
+impl SignalWebSocket<Identified> {
+    /// Reserves the first available username out of `candidates`, which are
+    /// tried in order. Returns `None` if every candidate is taken.
+    ///
+    /// Use [usernames::Username::candidates_from] to generate candidates for a
+    /// nickname with random discriminators, the way the official clients do.
+    /// A reservation only holds for a few minutes, so confirm it with
+    /// [Self::confirm_username] straight away.
+    // Based on Signal-Server's AccountController::reserveUsernameHash
+    pub async fn reserve_username(
+        &mut self,
+        candidates: Vec<usernames::Username>,
+    ) -> Result<Option<UsernameReservation>, ServiceError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ReserveUsernameHashRequest {
+            username_hashes: Vec<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ReserveUsernameHashResponse {
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            username_hash: Vec<u8>,
+        }
+
+        if candidates.is_empty() || candidates.len() > MAX_USERNAME_CANDIDATES {
+            return Err(ServiceError::InvalidFrame {
+                reason: "username reservation needs 1 to 20 candidates",
+            });
+        }
+
+        let username_hashes = candidates
+            .iter()
+            .map(|candidate| BASE64_URL_SAFE_NO_PAD.encode(candidate.hash()))
+            .collect();
+
+        let response = self
+            .http_request(Method::PUT, "/v1/accounts/username_hash/reserve")?
+            .send_json(ReserveUsernameHashRequest { username_hashes })
+            .await?;
+
+        // The generic status handling reads 409 as mismatched devices, but
+        // here it means every candidate is taken.
+        if response.status() == 409 {
+            return Ok(None);
+        }
+
+        let result: ReserveUsernameHashResponse =
+            response.service_error_for_status().await?.json().await?;
+
+        let username = candidates
+            .into_iter()
+            .find(|candidate| candidate.hash()[..] == result.username_hash[..])
+            .ok_or(ServiceError::InvalidFrame {
+                reason: "server reserved a username hash we did not ask for",
+            })?;
+
+        Ok(Some(UsernameReservation { username }))
+    }
+
+    /// Makes a reserved username this account's username, replacing any
+    /// previous one, and sets up a fresh username link for it.
+    ///
+    /// Returns `None` if the reservation is gone, either because it expired
+    /// or because someone else took the username in the meantime. Reserve
+    /// again in that case.
+    // Based on Signal-Server's AccountController::confirmUsernameHash
+    pub async fn confirm_username(
+        &mut self,
+        reservation: UsernameReservation,
+    ) -> Result<Option<ConfirmedUsername>, ServiceError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ConfirmUsernameHashRequest {
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            username_hash: [u8; 32],
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            zk_proof: Vec<u8>,
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            encrypted_username: Vec<u8>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct UsernameHashResponse {
+            username_link_handle: Option<uuid::Uuid>,
+        }
+
+        let UsernameReservation { username } = reservation;
+
+        let mut randomness = [0u8; 32];
+        rand::rng().fill_bytes(&mut randomness);
+        let zk_proof = username.proof(&randomness).map_err(|_| {
+            ServiceError::InvalidFrame {
+                reason: "failed to prove username hash",
+            }
+        })?;
+
+        let (entropy, encrypted_username) = usernames::create_for_username(
+            &mut rand::rng(),
+            username.to_string(),
+            None,
+        )
+        .map_err(|_| ServiceError::InvalidFrame {
+            reason: "username too long to encrypt",
+        })?;
+
+        let response = self
+            .http_request(Method::PUT, "/v1/accounts/username_hash/confirm")?
+            .send_json(ConfirmUsernameHashRequest {
+                username_hash: username.hash(),
+                zk_proof,
+                encrypted_username,
+            })
+            .await?;
+
+        // 409: no matching reservation. 410: the username was taken after all.
+        // The generic status handling would misread both as device errors.
+        if response.status() == 409 || response.status() == 410 {
+            return Ok(None);
+        }
+
+        let result: UsernameHashResponse =
+            response.service_error_for_status().await?.json().await?;
+
+        Ok(Some(ConfirmedUsername {
+            link: result
+                .username_link_handle
+                .map(|handle| generate_username_link(handle, &entropy)),
+            username,
+        }))
+    }
+
+    /// Removes this account's username and username link. Succeeds if there
+    /// was no username to begin with.
+    // Based on Signal-Server's AccountController::deleteUsernameHash
+    pub async fn delete_username(&mut self) -> Result<(), ServiceError> {
+        self.http_request(Method::DELETE, "/v1/accounts/username_hash")?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+        Ok(())
     }
 }
 

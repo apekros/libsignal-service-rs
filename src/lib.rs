@@ -83,7 +83,7 @@ pub mod prelude {
 pub mod protocol {
     pub use libsignal_core::{InvalidDeviceId, E164};
     pub use libsignal_protocol::*;
-    pub use usernames::{Username, UsernameError};
+    pub use usernames::{NicknameLimits, Username, UsernameError};
 }
 
 pub use libsignal_account_keys;
