@@ -844,7 +844,7 @@ where
                 &mut rng,
             )?;
         Ok(crate::proto::PniSignatureMessage {
-            pni: Some(self.local_pni.service_id_binary()),
+            pni: Some(crate::cipher::encode_pni_signature_pni(self.local_pni)),
             signature: Some(signature.into()),
         })
     }

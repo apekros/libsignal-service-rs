@@ -204,8 +204,7 @@ where
             return None;
         };
 
-        let Some(pni) =
-            Pni::parse_from_service_id_binary(pni_signature.pni.as_deref()?)
+        let Some(pni) = parse_pni_signature_pni(pni_signature.pni.as_deref()?)
         else {
             tracing::warn!("ignoring PNI signature: unparseable PNI");
             return None;
@@ -919,4 +918,43 @@ async fn sealed_sender_decrypt_with_validated_usmc(
         device_id: usmc.sender()?.sender_device_id()?,
         message,
     })
+}
+
+/// Encodes our PNI for [PniSignatureMessage::pni].
+///
+/// Official clients use the bare 16 byte UUID here, the kind is implied by the field. They do
+/// not use the 17 byte kind-prefixed service id binary: Signal-Desktop throws on it and
+/// Signal-iOS silently reads the wrong UUID out of it.
+pub(crate) fn encode_pni_signature_pni(pni: Pni) -> Vec<u8> {
+    Uuid::from(pni).into_bytes().to_vec()
+}
+
+/// Parses [PniSignatureMessage::pni], see [encode_pni_signature_pni].
+fn parse_pni_signature_pni(bytes: &[u8]) -> Option<Pni> {
+    <[u8; 16]>::try_from(bytes).ok().map(Pni::from_uuid_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use libsignal_protocol::Pni;
+    use uuid::Uuid;
+
+    use super::{encode_pni_signature_pni, parse_pni_signature_pni};
+
+    const PNI: Uuid = uuid::uuid!("9d0652a3-dcc3-4d11-975f-74d61598733f");
+
+    #[test]
+    fn pni_signature_pni_is_a_bare_uuid() {
+        let pni = Pni::from(PNI);
+        let encoded = encode_pni_signature_pni(pni);
+        assert_eq!(encoded, PNI.as_bytes());
+        assert_eq!(parse_pni_signature_pni(&encoded), Some(pni));
+    }
+
+    #[test]
+    fn pni_signature_pni_rejects_kind_prefixed_service_id() {
+        let prefixed = Pni::from(PNI).service_id_binary();
+        assert_eq!(prefixed.len(), 17);
+        assert_eq!(parse_pni_signature_pni(&prefixed), None);
+    }
 }
