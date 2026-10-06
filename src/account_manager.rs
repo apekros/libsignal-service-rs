@@ -556,12 +556,19 @@ impl AccountManager {
         let about_emoji = about_emoji.unwrap_or_default();
         let about_emoji = profile_cipher.encrypt_emoji(about_emoji, csprng)?;
 
-        // If avatar -> upload
-        if matches!(avatar, AvatarWrite::NewAvatar(_)) {
-            // FIXME ProfileCipherOutputStream.java
-            // It's just AES GCM, but a bit of work to decently implement it with a stream.
-            unimplemented!("Setting avatar requires ProfileCipherStream")
-        }
+        let avatar = match avatar {
+            AvatarWrite::NewAvatar(reader) => {
+                let mut plaintext = Vec::new();
+                reader.read_to_end(&mut plaintext).map_err(|error| {
+                    ProfileManagerError::ServiceError(ServiceError::IO(error))
+                })?;
+                AvatarWrite::NewAvatar(
+                    profile_cipher.encrypt_avatar(plaintext, csprng)?,
+                )
+            },
+            AvatarWrite::RetainAvatar => AvatarWrite::RetainAvatar,
+            AvatarWrite::NoAvatar => AvatarWrite::NoAvatar,
+        };
 
         let profile_key = profile_cipher.into_inner();
         let commitment = profile_key.get_commitment(aci);
@@ -569,7 +576,7 @@ impl AccountManager {
 
         Ok(self
             .websocket
-            .write_profile::<C, S>(
+            .write_profile(
                 &profile_key_version,
                 &name,
                 &about,

@@ -91,7 +91,14 @@ impl ProfileCipher {
         csprng: &mut R,
     ) -> Result<Vec<u8>, ProfileCipherError> {
         let _len = pad_plaintext(&mut bytes, padding_brackets)?;
+        self.encrypt(bytes, csprng)
+    }
 
+    fn encrypt<R: RngCore + CryptoRng>(
+        &self,
+        mut bytes: Vec<u8>,
+        csprng: &mut R,
+    ) -> Result<Vec<u8>, ProfileCipherError> {
         let cipher = Aes256Gcm::new(&self.profile_key.get_bytes().into());
         let mut nonce = [0u8; 12];
         csprng.fill_bytes(&mut nonce);
@@ -162,6 +169,18 @@ impl ProfileCipher {
             unrestricted_unidentified_access: encrypted_profile
                 .unrestricted_unidentified_access,
         })
+    }
+
+    /// Encrypts an avatar image for upload.
+    ///
+    /// Unpadded, like Signal-Desktop does it. [Self::decrypt_avatar] strips
+    /// trailing zeros, so it reads padded avatars from other clients too.
+    pub fn encrypt_avatar<R: RngCore + CryptoRng>(
+        &self,
+        avatar: Vec<u8>,
+        csprng: &mut R,
+    ) -> Result<Vec<u8>, ProfileCipherError> {
+        self.encrypt(avatar, csprng)
     }
 
     pub fn decrypt_avatar(
@@ -313,5 +332,24 @@ mod tests {
 
             assert_eq!(decrypted, emoji);
         }
+    }
+
+    #[test]
+    fn roundtrip_avatar() {
+        // PNG signature and the start of a header, enough to stand in for an image
+        let avatar = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+
+        let mut rng = rand::rng();
+        let some_randomness = rng.random();
+        let profile_key = ProfileKey::generate(some_randomness);
+        let cipher = ProfileCipher::new(profile_key);
+
+        let encrypted =
+            cipher.encrypt_avatar(avatar.clone(), &mut rng).unwrap();
+        // nonce, then the unpadded ciphertext, then the GCM tag
+        assert_eq!(encrypted.len(), 12 + avatar.len() + 16);
+        let decrypted = cipher.decrypt_avatar(&encrypted).unwrap();
+
+        assert_eq!(decrypted, avatar);
     }
 }

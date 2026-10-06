@@ -5,7 +5,7 @@ use zkgroup::profiles::{ProfileKeyCommitment, ProfileKeyVersion};
 
 use crate::{
     content::ServiceError,
-    push_service::AvatarWrite,
+    push_service::{AttachmentV2UploadAttributes, AvatarWrite},
     utils::{serde_base64, serde_optional_base64},
     websocket::{self, account::DeviceCapabilities, SignalWebSocket},
 };
@@ -116,22 +116,21 @@ impl SignalWebSocket<websocket::Identified> {
     /// Writes a profile and returns the avatar URL, if one was provided.
     ///
     /// The name, about and emoji fields are encrypted with an [`ProfileCipher`][struct@crate::profile_cipher::ProfileCipher].
+    /// So is a [AvatarWrite::NewAvatar], using
+    /// [`ProfileCipher::encrypt_avatar`][crate::profile_cipher::ProfileCipher::encrypt_avatar].
+    /// This uploads it to the CDN and returns its CDN key.
     /// See [`AccountManager`][struct@crate::AccountManager] for a convenience method.
     ///
     /// Java equivalent: `writeProfile`
-    pub async fn write_profile<'s, C, S>(
+    pub async fn write_profile(
         &mut self,
         version: &ProfileKeyVersion,
         name: &[u8],
         about: &[u8],
         emoji: &[u8],
         commitment: &ProfileKeyCommitment,
-        avatar: AvatarWrite<&mut C>,
-    ) -> Result<Option<String>, ServiceError>
-    where
-        C: std::io::Read + Send + 's,
-        S: AsRef<str>,
-    {
+        avatar: AvatarWrite<Vec<u8>>,
+    ) -> Result<Option<String>, ServiceError> {
         // Bincode is transparent and will return a hex-encoded string.
         let version = bincode::serialize(version)?;
         let version = std::str::from_utf8(&version)
@@ -148,37 +147,32 @@ impl SignalWebSocket<websocket::Identified> {
             commitment: &commitment,
         };
 
-        // XXX this should  be a struct; cfr ProfileAvatarUploadAttributes
-        let upload_url: Result<String, _> = self
+        let response = self
             .http_request(Method::PUT, "/v1/profile")?
             .send_json(&command)
             .await?
             .service_error_for_status()
-            .await?
-            .json()
-            .await;
+            .await?;
 
-        match (upload_url, avatar) {
-            (_url, AvatarWrite::NewAvatar(_avatar)) => {
-                // FIXME
-                unreachable!("Uploading avatar unimplemented");
-            },
-            // FIXME cleanup when #54883 is stable and MSRV:
-            // or-patterns syntax is experimental
-            // see issue #54883 <https://github.com/rust-lang/rust/issues/54883> for more information
-            (Err(_), AvatarWrite::RetainAvatar)
-            | (Err(_), AvatarWrite::NoAvatar) => {
-                // OWS sends an empty string when there's no attachment
-                Ok(None)
-            },
-            (Ok(_resp), AvatarWrite::RetainAvatar)
-            | (Ok(_resp), AvatarWrite::NoAvatar) => {
-                tracing::warn!(
-                    "No avatar supplied but got avatar upload URL. Ignoring"
-                );
-                Ok(None)
-            },
-        }
+        let AvatarWrite::NewAvatar(encrypted_avatar) = avatar else {
+            // The server answers with an empty body when there's nothing to upload.
+            return Ok(None);
+        };
+
+        // For a new avatar the server answers with a signed S3 form to upload it with.
+        let upload_attributes: AttachmentV2UploadAttributes =
+            response.json().await?;
+        let key = upload_attributes.key.clone();
+        self.unidentified_push_service
+            .upload_to_cdn0(
+                "/",
+                upload_attributes,
+                "avatar".into(),
+                std::io::Cursor::new(encrypted_avatar),
+            )
+            .await?;
+
+        Ok(Some(key))
     }
 }
 

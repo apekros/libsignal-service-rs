@@ -23,7 +23,7 @@ use super::{response::ReqwestExt, PushService, ServiceError};
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentV2UploadAttributes {
-    key: String,
+    pub(crate) key: String,
     credential: String,
     acl: String,
     algorithm: String,
